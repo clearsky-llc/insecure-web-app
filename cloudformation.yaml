@@ -1,0 +1,238 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Three-tier web application with intentional security weaknesses for demonstration purposes'
+
+Resources:
+  # VPC Configuration with a single subnet (intentional weakness - no network segmentation)
+  ApplicationVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: InsecureAppVPC
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ApplicationVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PublicSubnet
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: InsecureAppIGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref ApplicationVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ApplicationVPC
+      Tags:
+        - Key: Name
+          Value: PublicRouteTable
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Group (intentionally overly permissive)
+  InsecureSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Insecure security group allowing all traffic
+      VpcId: !Ref ApplicationVPC
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  # Frontend - S3 Bucket (public access)
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: PublicRead
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Join ['', ['arn:aws:s3:::', !Ref FrontendBucket, '/*']]
+
+  # Web Server EC2 Instance
+  WebServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: ami-0c55b159cbfafe1f0  # Amazon Linux 2 AMI (change to the appropriate AMI ID for your region)
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref InsecureSecurityGroup
+      KeyName: insecure-key-pair  # Make sure to create this key pair in AWS before deployment
+      IamInstanceProfile: !Ref WebServerInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum update -y
+          yum install -y git docker
+          service docker start
+          chkconfig docker on
+          
+          # Clone the application repository
+          git clone https://github.com/yourusername/insecure-web-app.git
+          cd insecure-web-app/web-tier
+          
+          # Start the web server
+          docker build -t web-tier .
+          docker run -d -p 80:80 -p 22:22 -p 3389:3389 web-tier
+          
+          # Print environment variables with sensitive info (intentional weakness)
+          echo "DB_PASSWORD=insecure_password" >> /etc/environment
+          echo "API_KEY=12345abcde" >> /etc/environment
+
+  # Application Tier - EC2 instance acting as app server
+  AppServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: ami-0c55b159cbfafe1f0
+      SubnetId: !Ref PublicSubnet  # Intentional weakness: app tier in public subnet
+      SecurityGroupIds:
+        - !Ref InsecureSecurityGroup
+      KeyName: insecure-key-pair
+      IamInstanceProfile: !Ref AppServerInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum update -y
+          yum install -y git docker
+          service docker start
+          chkconfig docker on
+          
+          # Clone the application repository
+          git clone https://github.com/yourusername/insecure-web-app.git
+          cd insecure-web-app/app-tier
+          
+          # Start the application server
+          docker build -t app-tier .
+          docker run -d -p 8080:8080 -e "DB_HOST=${InsecureRDSInstance.Endpoint.Address}" -e "DB_USER=admin" -e "DB_PASSWORD=insecure_password" app-tier
+
+  # Database Tier - RDS instance
+  InsecureRDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AllocatedStorage: 20
+      DBInstanceClass: db.t2.micro
+      Engine: mysql
+      EngineVersion: 5.7
+      DBName: insecureapp
+      MasterUsername: admin
+      MasterUserPassword: insecure_password  # Intentional weakness: hardcoded password
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref InsecureSecurityGroup
+      PubliclyAccessible: true  # Intentional weakness: publicly accessible database
+      StorageEncrypted: false  # Intentional weakness: unencrypted storage
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for insecure RDS
+      SubnetIds:
+        - !Ref PublicSubnet
+        # Ideally, we would have a second subnet in a different AZ, but for demonstration purposes we only have one
+
+  # IAM Roles (Overly permissive - intentional weakness)
+  WebServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess  # Intentional weakness: excessive permissions
+
+  WebServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WebServerRole
+
+  AppServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess  # Intentional weakness: excessive permissions
+
+  AppServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref AppServerRole
+
+Outputs:
+  WebsiteURL:
+    Description: URL for the frontend website
+    Value: !GetAtt FrontendBucket.WebsiteURL
+
+  WebServerIP:
+    Description: Public IP of the web server
+    Value: !GetAtt WebServerInstance.PublicIp
+
+  AppServerIP:
+    Description: Public IP of the application server
+    Value: !GetAtt AppServerInstance.PublicIp
+
+  DatabaseEndpoint:
+    Description: Endpoint of the RDS instance
+    Value: !GetAtt InsecureRDSInstance.Endpoint.Address
